@@ -8,6 +8,7 @@ const insightsConfig = {
   responseMimeType: "application/json",
   maxOutputTokens: 2048,
 };
+const INSIGHT_REFRESH_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const generateAIInsights = async (industry) => {
   const prompt = `
@@ -56,18 +57,24 @@ export async function getIndustryInsights() {
 
   const now = new Date();
   const existing = user.industryInsight;
-  const isStale = !existing || new Date(existing.nextUpdate) <= now;
+  const isStale =
+    !existing ||
+    new Date(existing.nextUpdate) <= now ||
+    now.getTime() - new Date(existing.lastUpdated).getTime() >=
+      INSIGHT_REFRESH_INTERVAL_MS;
   const hasEmptySalaries = existing && (!existing.salaryRanges || existing.salaryRanges.length === 0);
 
   // If no insights exist, or they're stale, or salary data is empty, regenerate
   if (isStale || hasEmptySalaries) {
     try {
       const insights = await generateAIInsights(user.industry);
+      const updatedAt = new Date();
 
       const upsertData = {
         industry: user.industry,
         ...insights,
-        nextUpdate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        lastUpdated: updatedAt,
+        nextUpdate: new Date(updatedAt.getTime() + INSIGHT_REFRESH_INTERVAL_MS),
       };
 
       if (existing) {
