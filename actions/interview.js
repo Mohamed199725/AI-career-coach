@@ -2,52 +2,26 @@
 
 import { db } from "@/lib/prisma";
 import { auth } from "@clerk/nextjs/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import {
+  describeGeminiError,
+  withGeminiModels,
+} from "@/lib/gemini";
 import { withCache } from "@/lib/ai-cache";
 
-// Generation can take 20s+ for 10 questions, so we allow a generous but bounded timeout
-const GEMINI_TIMEOUT_MS = 90000;
+// Generation can take 25-60s for 10 questions; withGeminiModels bounds the whole
+// fallback chain and moves on from a model that stalls.
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // Measured: a request costs ~14s of fixed server overhead on this key, largely
 // independent of prompt size, so the win is in making fewer round trips rather
 // than in a cheaper model. Keeping responses bounded also cuts decode time.
-const MODEL = "gemini-3.5-flash-lite";
 const MAX_OUTPUT_TOKENS = 4096;
-const model = genAI.getGenerativeModel({
-  model: MODEL,
-  generationConfig: {
-    responseMimeType: "application/json",
-    maxOutputTokens: MAX_OUTPUT_TOKENS,
-  },
-});
+const quizConfig = {
+  responseMimeType: "application/json",
+  maxOutputTokens: MAX_OUTPUT_TOKENS,
+};
 
 // Improvement tips are plain text, not JSON.
-const textModel = genAI.getGenerativeModel({
-  model: MODEL,
-  generationConfig: { maxOutputTokens: 256 },
-});
-
-// The SDK throws errors carrying the upstream HTTP status, so report the real cause
-// instead of blaming the user's connection for everything.
-function describeGeminiError(error) {
-  const message = error?.message || "";
-  const status = message.match(/\[(\d{3})[^\]]*\]/)?.[1];
-
-  if (status === "429") {
-    return "Daily AI question limit reached. Please try again tomorrow.";
-  }
-  if (status === "503" || status === "500") {
-    return "The AI service is busy right now. Please try again in a moment.";
-  }
-  if (status === "401" || status === "403") {
-    return "The AI service rejected our API key. Please check GEMINI_API_KEY.";
-  }
-  if (message.includes("timed out after")) {
-    return "Question generation took too long. Please try again.";
-  }
-  return "Failed to generate questions. Please try again.";
-}
+const tipConfig = { maxOutputTokens: 256 };
 
 export async function generateQuiz() {
   const { userId } = await auth();
@@ -85,28 +59,16 @@ export async function generateQuiz() {
     }
   `;
 
+  // The timeout lives in withGeminiModels so that every fallback attempt is bounded
+  // too; here we only wait for that chain to finish.
   let result;
-  let timer;
   try {
-    // Race against a timer: the SDK's own `timeout` option calls AbortController.abort()
-    // inside setTimeout, which Turbopack's module wrapper closes over and fires instantly,
-    // killing every request. Racing leaves the request alone and still bounds the wait.
-    result = await Promise.race([
-      model.generateContent(prompt),
-      new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`Generation timed out after ${GEMINI_TIMEOUT_MS}ms`)),
-          GEMINI_TIMEOUT_MS
-        );
-      }),
-    ]);
+    result = await withGeminiModels({ generationConfig: quizConfig, prompt });
   } catch (error) {
     console.error("Error generating quiz:", error);
     // Return the failure as data instead of throwing: a Server Action that throws
     // surfaces as an opaque 500 and the real reason never reaches the user.
     return { error: describeGeminiError(error) };
-  } finally {
-    clearTimeout(timer);
   }
 
   const text = result.response.text();
@@ -156,7 +118,6 @@ export async function saveQuizResult(questions, answers, score) {
   // The tip is fetched concurrently with the DB write below instead of before it:
   // each Gemini call costs ~14s of fixed overhead, so awaiting them in series
   // made saving a result take twice as long as either step alone.
-  let improvementTip = null;
   let tipPromise = null;
   if (wrongAnswers.length > 0) {
     const wrongQuestionsText = wrongAnswers
@@ -180,7 +141,14 @@ export async function saveQuizResult(questions, answers, score) {
     tipPromise = withCache(
       "gemini-3.5-flash-lite-tip",
       improvementPrompt,
-      async () => (await textModel.generateContent(improvementPrompt)).response.text().trim()
+      async () =>
+        (
+          await withGeminiModels({ generationConfig: tipConfig }, (model) =>
+            model.generateContent(improvementPrompt)
+          )
+        )
+          .response.text()
+          .trim()
     )
       .catch((error) => {
         console.error("Error generating improvement tip:", error);
@@ -190,21 +158,27 @@ export async function saveQuizResult(questions, answers, score) {
   }
 
   try {
-    // The model call was started above and has been running while the request was
-    // being assembled; awaiting it here only pays for whatever time is left.
-    improvementTip = await (tipPromise ?? null);
-
-    const assessment = await db.assessment.create({
+    const assessmentPromise = db.assessment.create({
       data: {
         userId: user.id,
         quizScore: score,
         questions: questionResults,
         category: "Technical",
-        improvementTip,
+        improvementTip: null,
       },
     });
 
-    return assessment;
+    const [assessment, generatedTip] = await Promise.all([
+      assessmentPromise,
+      tipPromise ?? Promise.resolve(null),
+    ]);
+
+    if (!generatedTip) return assessment;
+
+    return await db.assessment.update({
+      where: { id: assessment.id },
+      data: { improvementTip: generatedTip },
+    });
   } catch (error) {
     console.error("Error saving quiz result:", error);
     throw new Error("Failed to save quiz result");

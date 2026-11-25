@@ -2,13 +2,12 @@
 
 import { db } from "@/lib/prisma";
 import { auth } from "@clerk/nextjs/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { withGeminiModels } from "@/lib/gemini";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ 
-  model: "gemini-3.5-flash-lite",
-  generationConfig: { responseMimeType: "application/json" },
-});
+const insightsConfig = {
+  responseMimeType: "application/json",
+  maxOutputTokens: 2048,
+};
 
 export const generateAIInsights = async (industry) => {
   const prompt = `
@@ -31,7 +30,10 @@ export const generateAIInsights = async (industry) => {
           Include at least 5 skills and trends.
         `;
 
-  const result = await model.generateContent(prompt);
+  const result = await withGeminiModels(
+    { generationConfig: insightsConfig },
+    (model) => model.generateContent(prompt)
+  );
   const response = result.response;
   const text = response.text();
   const cleanedText = text.replace(/```(?:json)?\n?/g, "").trim();

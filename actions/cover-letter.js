@@ -2,17 +2,13 @@
 
 import { db } from "@/lib/prisma";
 import { auth } from "@clerk/nextjs/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { describeGeminiError, withGeminiModels } from "@/lib/gemini";
 import { withCache } from "@/lib/ai-cache";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // gemini-1.5-flash is retired and returns 404.
 // maxOutputTokens caps decode time: the prompt asks for "max 400 words" (~1000
 // tokens), leaving headroom without letting the model ramble at full length.
-const model = genAI.getGenerativeModel({
-  model: "gemini-3.5-flash-lite",
-  generationConfig: { maxOutputTokens: 1600 },
-});
+const letterConfig = { maxOutputTokens: 1600 };
 
 export async function generateCoverLetter(data) {
   const { userId } = await auth();
@@ -57,7 +53,14 @@ export async function generateCoverLetter(data) {
     const content = await withCache(
       "gemini-3.5-flash-lite-cover-letter",
       prompt,
-      async () => (await model.generateContent(prompt)).response.text().trim()
+      async () =>
+        (
+          await withGeminiModels({ generationConfig: letterConfig }, (model) =>
+            model.generateContent(prompt)
+          )
+        )
+          .response.text()
+          .trim()
     );
 
     const coverLetter = await db.coverLetter.create({
@@ -74,16 +77,7 @@ export async function generateCoverLetter(data) {
     return coverLetter;
   } catch (error) {
     console.error("Error generating cover letter:", error.message);
-    const status = error?.message?.match(/\[(\d{3})[^\]]*\]/)?.[1];
-
-    if (status === "429") {
-      return { error: "Daily AI limit reached. Please try again tomorrow." };
-    }
-    if (status === "503" || status === "500") {
-      return { error: "The AI service is busy right now. Please try again." };
-    }
-    // Return instead of throw: an uncaught Server Action error is an opaque 500
-    return { error: "Failed to generate cover letter. Please try again." };
+    return { error: describeGeminiError(error) };
   }
 }
 

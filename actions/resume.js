@@ -2,18 +2,14 @@
 
 import { db } from "@/lib/prisma";
 import { auth } from "@clerk/nextjs/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { revalidatePath } from "next/cache";
+import { describeGeminiError, withGeminiModels } from "@/lib/gemini";
 import { withCache } from "@/lib/ai-cache";
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // gemini-1.5-flash is retired and returns 404; flash-lite is fast and has its own quota.
 // maxOutputTokens bounds decode time: the result is a single short paragraph, so
 // there is no reason to let generation run to the default ceiling.
-const model = genAI.getGenerativeModel({
-  model: "gemini-3.5-flash-lite",
-  generationConfig: { maxOutputTokens: 512 },
-});
+const improveConfig = { maxOutputTokens: 512 };
 
 export async function saveResume(content) {
   const { userId } = await auth();
@@ -99,7 +95,14 @@ export async function improveWithAI({ current, type }) {
     const improvedContent = await withCache(
       "gemini-3.5-flash-lite-improve",
       prompt,
-      async () => (await model.generateContent(prompt)).response.text().trim()
+      async () =>
+        (
+          await withGeminiModels({ generationConfig: improveConfig }, (model) =>
+            model.generateContent(prompt)
+          )
+        )
+          .response.text()
+          .trim()
     );
 
     if (!improvedContent) {
@@ -109,15 +112,6 @@ export async function improveWithAI({ current, type }) {
     return { content: improvedContent };
   } catch (error) {
     console.error("Error improving content:", error);
-    const status = error?.message?.match(/\[(\d{3})[^\]]*\]/)?.[1];
-
-    if (status === "429") {
-      return { error: "Daily AI limit reached. Please try again tomorrow." };
-    }
-    if (status === "503" || status === "500") {
-      return { error: "The AI service is busy right now. Please try again." };
-    }
-    // Return instead of throw: an uncaught Server Action error is an opaque 500
-    return { error: "Failed to improve content. Please try again." };
+    return { error: describeGeminiError(error) };
   }
 }
